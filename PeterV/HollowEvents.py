@@ -16,6 +16,10 @@ WARNING_TICKS = 30          # ticks (real seconds) between "incoming" and impact
 SPAWN_GAP = (20, 60)        # random ticks between new events
 MAX_ACTIVE = 4             # cap on events scheduled or running at once
 
+# The top levels (level 1 = top) are shielded from redirectable events such as power
+# outages: those get diverted to a random lower level. 20% of levels -> 2 of 10, 4 of 20.
+PROTECTED_FRACTION = 0.20
+
 
 @dataclass(frozen=True)
 class EventType:
@@ -25,14 +29,16 @@ class EventType:
     drain: dict = field(default_factory=dict)      # system -> points lost PER TICK while active
     duration: int = 0                              # ticks the drain lasts
     weight: int = 1                                # higher = more common
+    redirect: bool = False                         # True = never hits a protected top level
+    lung_disease: float = 0.0                      # fraction of living residents on the level infected
 
 
 EVENT_TYPES = [
     EventType("power_outage", "Power outage on level {level}",
-              drops={"electricity": 50, "communication": 15}, weight=3),
+              drops={"electricity": 50, "communication": 15}, weight=3, redirect=True),
     EventType("air_quality", "Air quality critical on level {level}: lung disease spreading, people eating more",
               drops={"oxygen": 20, "medicine": 10},
-              drain={"food": 0.15}, duration=120, weight=2),
+              drain={"food": 0.15}, duration=120, weight=2, lung_disease=0.4),
     EventType("oxygen_leak", "Oxygen levels dropping on level {level}",
               drops={"oxygen": 40},
               drain={"oxygen": 0.10}, duration=60, weight=2),
@@ -51,7 +57,10 @@ class EventManager:
     def __init__(self, con, rng=None):
         self.con = con
         self.rng = rng or random.Random()
-        self.levels = [r[0] for r in con.execute("SELECT level FROM levels")]
+        self.levels = sorted(r[0] for r in con.execute("SELECT level FROM levels"))
+        n_protected = round(len(self.levels) * PROTECTED_FRACTION)
+        self.protected = set(self.levels[:n_protected])          # top levels = lowest numbers
+        self.safe_levels = [l for l in self.levels if l not in self.protected]
         self.pending = []     # [ticks_left, EventType, level]
         self.active = []      # [ticks_left, EventType, level]
         self._next_spawn = self.rng.randint(*SPAWN_GAP)
@@ -72,6 +81,7 @@ class EventManager:
         et = next(e for e in EVENT_TYPES if e.name == name)
         msgs = []
         with self.con:
+            level = self._redirect(et, level, sim_time, msgs)
             self._fire(et, level, sim_time, msgs)
         return msgs
 
@@ -87,13 +97,22 @@ class EventManager:
             "UPDATE level_systems SET status = MIN(100, MAX(0, status + ?)) "
             "WHERE level = ? AND system = ?", (delta, level, system))
 
+    def _redirect(self, et, level, sim_time, msgs):
+        """Divert redirectable events (power outages) off protected top levels."""
+        if et.redirect and level in self.protected and self.safe_levels:
+            new = self.rng.choice(self.safe_levels)
+            self._log(sim_time, level, next(iter(et.drops)),
+                      f"Protected level {level}: {et.name} diverted to level {new}", msgs)
+            return new
+        return level
+
     def _maybe_spawn(self, sim_time, msgs):
         self._next_spawn -= 1
         if self._next_spawn > 0 or len(self.pending) + len(self.active) >= MAX_ACTIVE:
             return
         self._next_spawn = self.rng.randint(*SPAWN_GAP)
         et = self.rng.choices(EVENT_TYPES, weights=[e.weight for e in EVENT_TYPES])[0]
-        level = self.rng.choice(self.levels)
+        level = self._redirect(et, self.rng.choice(self.levels), sim_time, msgs)
         self.pending.append([WARNING_TICKS, et, level])
         first_system = next(iter(et.drops))
         self._log(sim_time, level, first_system,
@@ -112,6 +131,14 @@ class EventManager:
     def _fire(self, et, level, sim_time, msgs):
         for system, points in et.drops.items():
             self._change(level, system, -points)
+        if et.lung_disease:
+            # infected residents can't heal (see flush_effects in Hpeople.py)
+            n = self.con.execute(
+                "UPDATE residents SET lung_disease = 1 "
+                "WHERE level = ? AND health > 0 AND lung_disease = 0 AND (ABS(RANDOM()) % 1000) < ?",
+                (level, int(et.lung_disease * 1000))).rowcount
+            self._log(sim_time, level, "oxygen",
+                      f"{n:,} residents on level {level} developed lung disease", msgs)
         self._log(sim_time, level, next(iter(et.drops)), et.message.format(level=level), msgs)
         if et.duration:
             self.active.append([et.duration, et, level])
