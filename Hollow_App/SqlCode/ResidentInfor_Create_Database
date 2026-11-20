@@ -1,0 +1,559 @@
+/*
+    ResidentInfors - SQL Server version
+    Converts the SQLite/Python "The Hollow" database logic into T-SQL.
+
+    Includes:
+      - Account table from SQLQuery1.sql
+      - 10 levels and 1,000,000 generated residents
+      - System definitions and per-level system status
+      - Accumulated effects, event log, indexes
+      - Stored procedures for status changes, simulation ticks, flushing,
+        population refresh, and dashboard reporting
+
+    IMPORTANT:
+      1. Run this script in SQL Server Management Studio (SSMS).
+      2. The resident seed section inserts 1,000,000 rows. It can take time
+         and consume transaction log/storage space.
+      3. The sample admin password below follows the uploaded SQL file.
+         For a real application, store a salted password hash, not plaintext.
+*/
+
+USE master;
+GO
+
+IF DB_ID(N'ResidentInfors') IS NULL
+    CREATE DATABASE ResidentInfors;
+GO
+
+USE ResidentInfors;
+GO
+
+SET NOCOUNT ON;
+GO
+
+/*==============================================================
+  1. RESET TABLES
+  Drop dependent tables first. This makes the script rerunnable,
+  but it deletes existing data in these tables.
+==============================================================*/
+DROP PROCEDURE IF EXISTS dbo.usp_CreateAccount;
+DROP PROCEDURE IF EXISTS dbo.usp_LevelSummary;
+DROP PROCEDURE IF EXISTS dbo.usp_SystemMatrix;
+DROP PROCEDURE IF EXISTS dbo.usp_LevelDashboard;
+DROP PROCEDURE IF EXISTS dbo.usp_RefreshPopulation;
+DROP PROCEDURE IF EXISTS dbo.usp_FlushEffects;
+DROP PROCEDURE IF EXISTS dbo.usp_Tick;
+DROP PROCEDURE IF EXISTS dbo.usp_RecomputeRates;
+DROP PROCEDURE IF EXISTS dbo.usp_DamageSystem;
+DROP PROCEDURE IF EXISTS dbo.usp_SetSystemStatus;
+GO
+
+DROP TABLE IF EXISTS dbo.Account;
+DROP TABLE IF EXISTS dbo.Jobs;
+DROP TABLE IF EXISTS dbo.Event_Log;
+DROP TABLE IF EXISTS dbo.Level_Effects;
+DROP TABLE IF EXISTS dbo.Level_Systems;
+DROP TABLE IF EXISTS dbo.Residents;
+DROP TABLE IF EXISTS dbo.System_Types;
+DROP TABLE IF EXISTS dbo.Levels;
+DROP SEQUENCE IF EXISTS dbo.Seq_ResidentID;
+GO
+
+/*==============================================================
+  2. TABLES
+==============================================================*/
+CREATE TABLE dbo.Account (
+    UserID       NVARCHAR(50)  NOT NULL PRIMARY KEY,
+    [Password]   NVARCHAR(255) NOT NULL,
+    [Level]      INT           NOT NULL CONSTRAINT DF_Account_Level DEFAULT (1),
+    FirstName    NVARCHAR(50)  NULL,
+    LastName     NVARCHAR(50)  NULL,
+    DateOfBirth  DATE          NULL,
+    CONSTRAINT CK_Account_Level CHECK ([Level] BETWEEN 1 AND 10)
+);
+GO
+
+-- Demo account from the uploaded SQLQuery1.sql.
+-- Replace plaintext password storage with a salted password hash in production.
+INSERT INTO dbo.Account (UserID, [Password], [Level])
+VALUES (N'admin', N'123456', 1);
+GO
+
+CREATE TABLE dbo.Levels (
+    [Level]      INT NOT NULL PRIMARY KEY CHECK ([Level] >= 1),
+    [Name]       NVARCHAR(50) NULL,
+    Population   INT NOT NULL CONSTRAINT DF_Levels_Population DEFAULT (0),
+    Alive        INT NOT NULL CONSTRAINT DF_Levels_Alive DEFAULT (0)
+);
+GO
+
+CREATE TABLE dbo.Residents (
+    ID       INT NOT NULL PRIMARY KEY,
+    Work     NVARCHAR(30) NOT NULL,
+    Health   INT NOT NULL CHECK (Health BETWEEN 0 AND 100),
+    Family   INT NOT NULL CHECK (Family >= 0),
+    [Level]  INT NOT NULL,
+    Money    INT NOT NULL,
+    CONSTRAINT FK_Residents_Levels
+        FOREIGN KEY ([Level]) REFERENCES dbo.Levels([Level])
+);
+GO
+
+CREATE TABLE dbo.System_Types (
+    System       NVARCHAR(50) NOT NULL PRIMARY KEY,
+    [Group]      NVARCHAR(100) NOT NULL,
+    Effect_Stat  NVARCHAR(10) NOT NULL
+        CHECK (Effect_Stat IN (N'health', N'money')),
+    Max_Rate     FLOAT NOT NULL
+);
+GO
+
+CREATE TABLE dbo.Level_Systems (
+    [Level]  INT NOT NULL,
+    System   NVARCHAR(50) NOT NULL,
+    [Status] FLOAT NOT NULL CONSTRAINT DF_LevelSystems_Status DEFAULT (100)
+        CHECK ([Status] BETWEEN 0 AND 100),
+    CONSTRAINT PK_Level_Systems PRIMARY KEY ([Level], System),
+    CONSTRAINT FK_LevelSystems_Levels
+        FOREIGN KEY ([Level]) REFERENCES dbo.Levels([Level]),
+    CONSTRAINT FK_LevelSystems_SystemTypes
+        FOREIGN KEY (System) REFERENCES dbo.System_Types(System)
+);
+GO
+
+CREATE TABLE dbo.Level_Effects (
+    [Level]          INT NOT NULL PRIMARY KEY,
+    Rate_Health      FLOAT NOT NULL CONSTRAINT DF_LevelEffects_RateHealth DEFAULT (0),
+    Pending_Health   FLOAT NOT NULL CONSTRAINT DF_LevelEffects_PendingHealth DEFAULT (0),
+    Rate_Money       FLOAT NOT NULL CONSTRAINT DF_LevelEffects_RateMoney DEFAULT (0),
+    Pending_Money    FLOAT NOT NULL CONSTRAINT DF_LevelEffects_PendingMoney DEFAULT (0),
+    CONSTRAINT FK_LevelEffects_Levels
+        FOREIGN KEY ([Level]) REFERENCES dbo.Levels([Level])
+);
+GO
+
+CREATE TABLE dbo.Event_Log (
+    ID        BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    Sim_Time  FLOAT NOT NULL,
+    [Level]   INT NULL,
+    System    NVARCHAR(50) NULL,
+    Message   NVARCHAR(400) NOT NULL
+);
+GO
+
+/*==============================================================
+  3. INDEXES
+==============================================================*/
+CREATE INDEX IX_Residents_Work ON dbo.Residents(Work);
+CREATE INDEX IX_Residents_Level ON dbo.Residents([Level]);
+CREATE INDEX IX_Residents_Work_Level ON dbo.Residents(Work, [Level]);
+CREATE INDEX IX_Residents_Level_Health ON dbo.Residents([Level], Health);
+CREATE INDEX IX_EventLog_SimTime ON dbo.Event_Log(Sim_Time);
+GO
+
+/*==============================================================
+  4. INITIAL DATA: 10 LEVELS AND SYSTEM TYPES
+==============================================================*/
+INSERT INTO dbo.Levels ([Level], [Name])
+VALUES
+(1, N'Level 1'), (2, N'Level 2'), (3, N'Level 3'),
+(4, N'Level 4'), (5, N'Level 5'), (6, N'Level 6'),
+(7, N'Level 7'), (8, N'Level 8'), (9, N'Level 9'),
+(10, N'Level 10');
+GO
+
+INSERT INTO dbo.System_Types (System, [Group], Effect_Stat, Max_Rate)
+VALUES
+(N'oxygen',        N'energy & infrastructure',   N'health', 1.00),
+(N'electricity',   N'energy & infrastructure',   N'health', 0.10),
+(N'water',         N'resource management',       N'health', 0.40),
+(N'food',          N'resource management',      N'health', 0.25),
+(N'medicine',      N'healthcare',                N'health', 0.15),
+(N'communication', N'communication & emergency', N'health', 0.02),
+(N'housing',       N'housing',                   N'health', 0.05);
+GO
+
+INSERT INTO dbo.Level_Systems ([Level], System, [Status])
+SELECT l.[Level], s.System, 100
+FROM dbo.Levels AS l
+CROSS JOIN dbo.System_Types AS s;
+
+INSERT INTO dbo.Level_Effects ([Level])
+SELECT [Level] FROM dbo.Levels;
+GO
+
+/*==============================================================
+  5. GENERATE RESIDENTS
+  Matches the Python distributions:
+    work weights: engineer 5, farmer 30, medic 8, miner 20,
+                  technician 10, teacher 8, guard 4, scavenger 15
+    health: 50..100, family: 0..7, level: 1..10, money: 0..4999
+==============================================================*/
+DECLARE @ResidentCount INT = 1000000;
+
+;WITH
+E1(N) AS (
+    SELECT N FROM (VALUES (1),(1),(1),(1),(1),(1),(1),(1),(1),(1)) AS X(N)
+),
+E2(N) AS (SELECT 1 FROM E1 A CROSS JOIN E1 B),       -- 100
+E4(N) AS (SELECT 1 FROM E2 A CROSS JOIN E2 B),       -- 10,000
+E6(N) AS (SELECT 1 FROM E4 A CROSS JOIN E2 B),       -- 1,000,000
+Numbers AS (
+    SELECT TOP (@ResidentCount)
+           ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS ID
+    FROM E6
+),
+RandomValues AS (
+    SELECT
+        ID,
+        ABS(CONVERT(BIGINT, CHECKSUM(NEWID()))) % 100 AS WorkRoll,
+        ABS(CONVERT(BIGINT, CHECKSUM(NEWID()))) % 51 AS HealthRoll,
+        ABS(CONVERT(BIGINT, CHECKSUM(NEWID()))) % 8 AS FamilyRoll,
+        ABS(CONVERT(BIGINT, CHECKSUM(NEWID()))) % 10 AS LevelRoll,
+        ABS(CONVERT(BIGINT, CHECKSUM(NEWID()))) % 5000 AS MoneyRoll
+    FROM Numbers
+)
+SELECT * INTO #Rolls FROM RandomValues;   -- roll each random value ONCE
+
+INSERT INTO dbo.Residents (ID, Work, Health, Family, [Level], Money)
+SELECT
+    ID,
+    CASE
+        WHEN WorkRoll < 5  THEN N'engineer'
+        WHEN WorkRoll < 35 THEN N'farmer'
+        WHEN WorkRoll < 43 THEN N'medic'
+        WHEN WorkRoll < 63 THEN N'miner'
+        WHEN WorkRoll < 73 THEN N'technician'
+        WHEN WorkRoll < 81 THEN N'teacher'
+        WHEN WorkRoll < 85 THEN N'guard'
+        ELSE N'scavenger'
+    END,
+    50 + HealthRoll,
+    FamilyRoll,
+    1 + LevelRoll,
+    MoneyRoll
+FROM #Rolls;
+
+DROP TABLE #Rolls;
+GO
+
+/*==============================================================
+  6. RECOMPUTE EFFECT RATES
+==============================================================*/
+CREATE PROCEDURE dbo.usp_RecomputeRates
+    @Level INT = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    UPDATE effects
+    SET
+        Rate_Health = COALESCE((
+            SELECT SUM(st.Max_Rate * (1.0 - ls.[Status] / 100.0))
+            FROM dbo.Level_Systems AS ls
+            INNER JOIN dbo.System_Types AS st ON st.System = ls.System
+            WHERE ls.[Level] = effects.[Level]
+              AND st.Effect_Stat = N'health'
+        ), 0),
+        Rate_Money = COALESCE((
+            SELECT SUM(st.Max_Rate * (1.0 - ls.[Status] / 100.0))
+            FROM dbo.Level_Systems AS ls
+            INNER JOIN dbo.System_Types AS st ON st.System = ls.System
+            WHERE ls.[Level] = effects.[Level]
+              AND st.Effect_Stat = N'money'
+        ), 0)
+    FROM dbo.Level_Effects AS effects
+    WHERE @Level IS NULL OR effects.[Level] = @Level;
+END;
+GO
+
+/*==============================================================
+  7. CHANGE SYSTEM STATUS
+==============================================================*/
+CREATE PROCEDURE dbo.usp_SetSystemStatus
+    @Level INT,
+    @System NVARCHAR(50),
+    @Status FLOAT,
+    @SimTime FLOAT = 0,
+    @WriteLog BIT = 1
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    IF @Status < 0 SET @Status = 0;
+    IF @Status > 100 SET @Status = 100;
+
+    BEGIN TRANSACTION;
+
+    UPDATE dbo.Level_Systems
+    SET [Status] = @Status
+    WHERE [Level] = @Level AND System = @System;
+
+    IF @@ROWCOUNT = 0
+    BEGIN
+        ROLLBACK TRANSACTION;
+        THROW 50001, 'System does not exist on the specified level.', 1;
+    END;
+
+    IF @WriteLog = 1
+    BEGIN
+        INSERT INTO dbo.Event_Log (Sim_Time, [Level], System, Message)
+        VALUES (@SimTime, @Level, @System,
+                CONCAT(@System, N' set to ', CONVERT(NVARCHAR(20), ROUND(@Status, 0)), N'%'));
+    END;
+
+    COMMIT TRANSACTION;
+
+    EXEC dbo.usp_RecomputeRates @Level = @Level;
+END;
+GO
+
+CREATE PROCEDURE dbo.usp_DamageSystem
+    @Level INT,
+    @System NVARCHAR(50),
+    @Amount FLOAT,
+    @SimTime FLOAT = 0
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @CurrentStatus FLOAT;
+
+    SELECT @CurrentStatus = [Status]
+    FROM dbo.Level_Systems
+    WHERE [Level] = @Level AND System = @System;
+
+    IF @CurrentStatus IS NULL
+        THROW 50002, 'System does not exist on the specified level.', 1;
+
+    -- Positive amount damages; negative amount repairs.
+DECLARE @NewStatus FLOAT;
+
+SET @NewStatus = @CurrentStatus - @Amount;
+
+EXEC dbo.usp_SetSystemStatus
+    @Level = @Level,
+    @System = @System,
+    @Status = @NewStatus,
+    @SimTime = @SimTime,
+    @WriteLog = 1;
+END;
+GO
+
+/*==============================================================
+  8. SIMULATION TICK
+  Updates only the 10 Level_Effects rows, not the resident records.
+==============================================================*/
+CREATE PROCEDURE dbo.usp_Tick
+    @DeltaSeconds FLOAT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    IF @DeltaSeconds < 0
+        THROW 50003, 'Delta seconds cannot be negative.', 1;
+
+    UPDATE dbo.Level_Effects
+    SET
+        Pending_Health = Pending_Health + Rate_Health * @DeltaSeconds,
+        Pending_Money  = Pending_Money  + Rate_Money  * @DeltaSeconds;
+END;
+GO
+
+/*==============================================================
+  9. APPLY ACCUMULATED EFFECTS TO RESIDENTS
+==============================================================*/
+CREATE PROCEDURE dbo.usp_FlushEffects
+    @Level INT = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    DECLARE @Applied TABLE (
+        [Level] INT PRIMARY KEY,
+        HealthPointsApplied INT,
+        MoneyApplied INT
+    );
+
+    BEGIN TRANSACTION;
+
+    DECLARE @CurrentLevel INT;
+    DECLARE @PendingHealth FLOAT;
+    DECLARE @PendingMoney FLOAT;
+    DECLARE @DamageHealth INT;
+    DECLARE @DamageMoney INT;
+
+    DECLARE effect_cursor CURSOR LOCAL FAST_FORWARD FOR
+        SELECT [Level], Pending_Health, Pending_Money
+        FROM dbo.Level_Effects
+        WHERE @Level IS NULL OR [Level] = @Level
+        ORDER BY [Level];
+
+    OPEN effect_cursor;
+
+    FETCH NEXT FROM effect_cursor
+    INTO @CurrentLevel, @PendingHealth, @PendingMoney;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @DamageHealth = FLOOR(@PendingHealth + 0.000000001);
+        SET @DamageMoney = FLOOR(@PendingMoney + 0.000000001);
+
+        IF @DamageHealth > 0 OR @DamageMoney > 0
+        BEGIN
+            -- As in the Python implementation, only living residents are updated.
+            UPDATE dbo.Residents
+            SET
+                Health = CASE
+                    WHEN Health - @DamageHealth < 0 THEN 0
+                    ELSE Health - @DamageHealth
+                END,
+                Money = CASE
+                    WHEN Money - @DamageMoney < 0 THEN 0
+                    ELSE Money - @DamageMoney
+                END
+            WHERE [Level] = @CurrentLevel
+              AND Health > 0;
+
+            UPDATE dbo.Level_Effects
+            SET
+                Pending_Health = Pending_Health - @DamageHealth,
+                Pending_Money = Pending_Money - @DamageMoney
+            WHERE [Level] = @CurrentLevel;
+
+            INSERT INTO @Applied ([Level], HealthPointsApplied, MoneyApplied)
+            VALUES (@CurrentLevel, @DamageHealth, @DamageMoney);
+        END;
+
+        FETCH NEXT FROM effect_cursor
+        INTO @CurrentLevel, @PendingHealth, @PendingMoney;
+    END;
+
+    CLOSE effect_cursor;
+    DEALLOCATE effect_cursor;
+
+    COMMIT TRANSACTION;
+
+    SELECT [Level], HealthPointsApplied, MoneyApplied
+    FROM @Applied
+    ORDER BY [Level];
+END;
+GO
+
+/*==============================================================
+  10. REFRESH CACHED POPULATION COUNTS
+==============================================================*/
+CREATE PROCEDURE dbo.usp_RefreshPopulation
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    UPDATE l
+    SET
+        Population = counts.Population,
+        Alive = counts.Alive
+    FROM dbo.Levels AS l
+    CROSS APPLY (
+        SELECT
+            COUNT(*) AS Population,
+            SUM(CASE WHEN r.Health > 0 THEN 1 ELSE 0 END) AS Alive
+        FROM dbo.Residents AS r
+        WHERE r.[Level] = l.[Level]
+    ) AS counts;
+END;
+GO
+
+/*==============================================================
+  11. REPORTING PROCEDURES
+==============================================================*/
+CREATE PROCEDURE dbo.usp_LevelDashboard
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT
+        l.[Level],
+        l.Population,
+        l.Alive,
+        e.Rate_Health,
+        e.Pending_Health,
+        worst.System AS Worst_System,
+        worst.[Status] AS Worst_Status
+    FROM dbo.Levels AS l
+    INNER JOIN dbo.Level_Effects AS e ON e.[Level] = l.[Level]
+    OUTER APPLY (
+        SELECT TOP (1) ls.System, ls.[Status]
+        FROM dbo.Level_Systems AS ls
+        WHERE ls.[Level] = l.[Level]
+        ORDER BY ls.[Status] ASC, ls.System ASC
+    ) AS worst
+    ORDER BY l.[Level];
+END;
+GO
+
+CREATE PROCEDURE dbo.usp_SystemMatrix
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT [Level], System, [Status]
+    FROM dbo.Level_Systems
+    ORDER BY [Level], System;
+END;
+GO
+
+CREATE PROCEDURE dbo.usp_LevelSummary
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT
+        [Level],
+        COUNT(*) AS Population,
+        ROUND(AVG(CONVERT(FLOAT, Money)), 0) AS Avg_Money,
+        ROUND(AVG(CONVERT(FLOAT, Health)), 1) AS Avg_Health
+    FROM dbo.Residents
+    GROUP BY [Level]
+    ORDER BY [Level];
+END;
+GO
+
+/*==============================================================
+  12. INITIAL POPULATION COUNTS
+==============================================================*/
+EXEC dbo.usp_RefreshPopulation;
+GO
+
+/*==============================================================
+  13. QUICK TEST / EXAMPLE
+  Uncomment to simulate oxygen degradation on level 3 for 60 sec.
+
+  EXEC dbo.usp_SetSystemStatus
+      @Level = 3, @System = N'oxygen', @Status = 20, @SimTime = 0;
+
+  DECLARE @i INT = 0;
+  WHILE @i < 60
+  BEGIN
+      EXEC dbo.usp_Tick @DeltaSeconds = 1;
+      SET @i += 1;
+  END;
+
+  SELECT AVG(CONVERT(FLOAT, Health)) AS AverageHealthBeforeFlush
+  FROM dbo.Residents WHERE [Level] = 3;
+
+  EXEC dbo.usp_FlushEffects;
+
+  EXEC dbo.usp_RefreshPopulation;
+
+  SELECT AVG(CONVERT(FLOAT, Health)) AS AverageHealthAfterFlush
+  FROM dbo.Residents WHERE [Level] = 3;
+
+  EXEC dbo.usp_LevelDashboard;
+==============================================================*/
+
+-- Verify
+SELECT COUNT(*) AS TotalResidents FROM dbo.Residents;
+EXEC dbo.usp_LevelDashboard;
+GO
