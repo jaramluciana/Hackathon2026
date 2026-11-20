@@ -1,45 +1,41 @@
-# HOLLOW-EXPLORE — runnable surface exploration prototype
+# HOLLOW-MED integration for Hollow City (SQL Server + Flet)
 
-This is a **fictional simulation**, not a real-world expedition safety system. It is a working local web app built with **Python's standard library, SQLite, HTML, CSS, and JavaScript**. No `pip install` needed.
+This is **not** the previous SQLite `hollow_med.py`: your teammate's new app uses `database.get_connection()` with pyodbc, SQL Server `ResidentInfors`, and string `Account.UserID` mapped to `Residents.ID` through `Account.ResidentID`.
 
-## Start in PyCharm / terminal
+## Install
 
-1. Unzip the project into one folder.
-2. Open that folder in PyCharm or VS Code.
-3. Run `python server.py` (or `python3 server.py`).
-4. Visit **http://127.0.0.1:8765** in your browser.
-5. Enter a resident ID (1–1000 in the initial demo) and click **Load profile**.
-6. To test the full workflow, select a mission for a resident with a preferred occupation and health ≥65; approve the application in Command Center, start it, submit a report, then verify the report. The resident's `money` field increases exactly once.
+1. **Back up** your existing SQL Server database. Run `setup_hollow_med.sql` against `ResidentInfors` using SQL Server Management Studio / Azure Data Studio. It creates only `Med_*` tables; existing teammate tables are unchanged.
+2. Place `hollow_med_sql.py` and `medical_screen.py` in the **same folder as `database.py` and `main.py`**. Do not replace `database.py`, `hollow_sim.py`, or `alert_engine.py`.
+3. The uploaded `main(1).py` imports `screens.login` and `screens.home`, but those two files were **not uploaded**. To add the medical page, edit your teammate's `screens/home.py` where the MEDICAL tile is defined. Import `medical_screen` and change its click callback to call:
 
-The first launch creates `hollow_world.sqlite3` with **1,000 simulated residents**, using your teammate's `hollow_db.py` schema. Later launches reuse the same file and **do not erase your data**. The original team's database builder is destructive; do not run it on a database you need to keep.
+```python
+medical_screen.show(page, user_id, level,
+                    on_back=lambda: show(page, user_id, level, name, go_login))
+```
 
-## Features
+This assumes `screens/home.py` exports `show(page, user_id, level, name, go_login)` as invoked in your teammate's main. If its local names differ, adjust the callback. The screen does not edit the home page automatically.
 
-- Fictional clickable surface map with seven sectors, hazard readings, confidence and resource clues.
-- Three sample missions with pay, expected duration, preferred occupations and hazard thresholds.
-- Volunteer applications, eligibility checks, coordinator approval/rejection.
-- Equipment forecast (oxygen, battery, water) and return reserve check.
-- Start mission, submit field report, coordinator verification and single-payment compensation.
-- A live coordinator dashboard with outstanding applications, active explorers, unverified reports, total credits paid.
-- SQLite storage using the existing `residents` table and `money` balance; separate `surface_*` and `exploration_*` tables.
+4. Install the team's dependencies (`flet`, `pyodbc`) and configure the SQL Server ODBC driver/connection. Your teammate uses `Trusted_Connection=yes`, which may require Windows integrated authentication; on macOS, this **will not automatically work** without an appropriate SQL Server authentication setup. Ask your teammate for their connection method; do not hard-code credentials into the project.
+5. Start the teammate's existing main app. The `medical_screen` will show a resident's level conditions, appointment requests, medical assistance requests, and notices.
 
-## Tests
+## Backend examples
 
-Run `python -m unittest -v test_explore.py`.
+```python
+import hollow_med_sql as med
+print(med.level_overview(3))
+print(med.forecast(3, 300))
+print(med.clinics())
+print(med.suggest_support(3, 'medical_kits', 20))
+print(med.resident_dashboard('A0000001'))  # use an actual existing account
+```
 
-## Integrating with your team's app
+## Important limitations
 
-`explore.py` contains the reusable logic. `server.py` exposes JSON endpoints including `/api/map`, `/api/missions`, `/api/resident?id=1`, `/api/equipment?hours=3&hazard=20`, `/api/apply`, `/api/decide`, `/api/start`, `/api/report`, and `/api/verify`.
-
-To use the team's **existing** database, set environment variable `HOLLOW_DB` to its SQLite file path **before** starting `server.py`. The file must already contain the `residents` and `levels` tables. The exploration tables will be added without deleting existing tables. If your team's database only exists in memory, it must first be persisted to a file or the application must share the same live database connection through an integrated server.
-
-## Important prototype limitations
-
-- **No authentication or permissions.** The resident selector and coordinator controls are open to anyone who can access this local demo. Do **not** deploy it publicly. Implement secure sessions, authorization, request ownership checks, CSRF protection, and audit logging first.
-- Sector coordinates are fictional 0–100 grid coordinates, **not real GPS**. No live geolocation, weather or sensor feeds.
-- Equipment consumption, mission eligibility and compensation values are fictional assumptions, not medical or real-world safety guidance.
-- Missions and sectors are seeded examples; edit `SECTORS` and `MISSIONS` in `explore.py` to change them. Existing seeded rows are preserved on restart.
-- Mission start/finish are manually controlled; no actual location tracking, communication, sensor telemetry, rescue dispatch or physical resource deduction yet.
-- Field reports improve confidence, but do not automatically declare an area safe. No route optimization or verified hazard classification yet.
-- Reports and pay require coordinator verification; credits are issued to the existing `residents.money` field only once.
-- For a million residents, use the team's existing persistent database instead of generating a million demo residents during a presentation.
+- **Not a clinical system.** Health score thresholds and forecasts are fictional and are not medical advice.
+- The new clinic inventories and capacity values are **demo seeds**, not measurements of real stock.
+- Appointments are **requests**; there is no scheduled time, treatment duration, or confirmed reservation until a staff workflow is built.
+- `suggest_support()` makes **read-only recommendations**; no automatic transfers or dispatches.
+- Staff permissions, verified emergency dispatch, secure user sessions, and real-time UI updates are **not implemented**. The Flet screen must only be accessed through your existing authenticated app. Do not deploy publicly.
+- The SQL Server schema of `Residents.Health`, `Residents.Level`, `Level_Effects`, `Levels`, and `Level_Systems` was inferred from the uploaded `hollow_sim.py` queries; the original SQL DDL was not supplied. Test against a backed-up copy and adjust if actual column types differ.
+- Existing alert engine is independent. `Med_Notices` are separate stored medical announcements; no automatic alert-engine subscription is claimed.
+- A one-million-resident forecast query can be expensive. Add an index on `Residents([Level],Health)` after testing query plans.
