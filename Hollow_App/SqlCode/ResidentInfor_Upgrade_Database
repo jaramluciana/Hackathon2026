@@ -1,0 +1,180 @@
+USE ResidentInfors;
+GO
+
+/* ---------- 1. Jobs ---------- */
+DROP TABLE IF EXISTS dbo.Jobs;
+CREATE TABLE dbo.Jobs (
+    Work        NVARCHAR(30) NOT NULL PRIMARY KEY,
+    BaseSalary  INT NOT NULL CHECK (BaseSalary >= 0),
+    Important   BIT NOT NULL DEFAULT (0)
+);
+INSERT INTO dbo.Jobs (Work, BaseSalary, Important) VALUES
+(N'engineer',   900, 1),(N'farmer',     400, 0),(N'medic',      800, 1),
+(N'miner',      500, 0),(N'technician', 700, 1),(N'teacher',    600, 0),
+(N'guard',      550, 0),(N'scavenger',  250, 0);
+GO
+
+/* ---------- 2. New Residents columns ---------- */
+IF COL_LENGTH('dbo.Residents','LiveStatus') IS NULL
+    ALTER TABLE dbo.Residents ADD LiveStatus NVARCHAR(10) NOT NULL
+        CONSTRAINT DF_Residents_LiveStatus DEFAULT (N'alive')
+        CONSTRAINT CK_Residents_LiveStatus CHECK (LiveStatus IN (N'alive', N'dead'));
+GO
+IF COL_LENGTH('dbo.Residents','Salary') IS NULL
+    ALTER TABLE dbo.Residents ADD Salary INT NOT NULL CONSTRAINT DF_Residents_Salary DEFAULT (0);
+GO
+IF COL_LENGTH('dbo.Residents','Important') IS NULL
+    ALTER TABLE dbo.Residents ADD Important BIT NOT NULL CONSTRAINT DF_Residents_Important DEFAULT (0);
+GO
+IF COL_LENGTH('dbo.Residents','CreatedAt') IS NULL
+    ALTER TABLE dbo.Residents ADD CreatedAt DATETIME2 NOT NULL CONSTRAINT DF_Residents_CreatedAt DEFAULT (SYSDATETIME());
+GO
+
+/* ---------- 3. Fill existing residents (takes a while) ---------- */
+UPDATE r SET r.Salary = j.BaseSalary, r.Important = j.Important
+FROM dbo.Residents AS r JOIN dbo.Jobs AS j ON j.Work = r.Work;
+UPDATE dbo.Residents SET LiveStatus = N'dead' WHERE Health = 0;
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Residents_LiveStatus')
+    CREATE INDEX IX_Residents_LiveStatus ON dbo.Residents([Level], LiveStatus);
+GO
+
+/* ---------- 4. Link Account -> Residents ---------- */
+IF COL_LENGTH('dbo.Account','ResidentID') IS NULL
+    ALTER TABLE dbo.Account ADD ResidentID INT NULL;
+GO
+IF OBJECT_ID('FK_Account_Residents') IS NULL
+    ALTER TABLE dbo.Account ADD CONSTRAINT FK_Account_Residents
+        FOREIGN KEY (ResidentID) REFERENCES dbo.Residents(ID);
+GO
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'UX_Account_ResidentID')
+    CREATE UNIQUE INDEX UX_Account_ResidentID ON dbo.Account(ResidentID) WHERE ResidentID IS NOT NULL;
+GO
+
+/* ---------- 5. Sequence for new resident IDs ---------- */
+IF OBJECT_ID('dbo.Seq_ResidentID') IS NULL
+BEGIN
+    DECLARE @start INT = (SELECT ISNULL(MAX(ID), 0) + 1 FROM dbo.Residents);
+    DECLARE @sql NVARCHAR(200) = N'CREATE SEQUENCE dbo.Seq_ResidentID AS INT START WITH '
+        + CAST(@start AS NVARCHAR(12)) + N' INCREMENT BY 1;';
+    EXEC (@sql);
+END
+GO
+
+/* ---------- 6. usp_CreateAccount (matches database.py) ---------- */
+CREATE OR ALTER PROCEDURE dbo.usp_CreateAccount
+    @FirstName   NVARCHAR(50),
+    @LastName    NVARCHAR(50),
+    @DateOfBirth DATE,
+    @Level       INT,
+    @Password    NVARCHAR(255),
+    @Work        NVARCHAR(30),
+    @Family      INT = 0,
+    @Money       INT = 1000,
+    @Important   BIT = NULL,
+    @NewUserID   NVARCHAR(50) OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    IF @Level NOT BETWEEN 1 AND 10
+        THROW 50010, 'Level must be between 1 and 10.', 1;
+
+    DECLARE @Salary INT, @JobImportant BIT;
+    SELECT @Salary = BaseSalary, @JobImportant = Important FROM dbo.Jobs WHERE Work = @Work;
+    IF @Salary IS NULL
+        THROW 50011, 'Unknown occupation.', 1;
+    SET @Important = COALESCE(@Important, @JobImportant);
+
+    DECLARE @Letter  NCHAR(1)     = NCHAR(64 + @Level);
+    DECLARE @Pattern NVARCHAR(20) = @Letter + REPLICATE(N'[0-9]', 7);
+    DECLARE @Last NVARCHAR(50), @Number INT, @ResidentID INT;
+
+    BEGIN TRANSACTION;
+
+    SELECT @Last = MAX(UserID COLLATE Latin1_General_BIN)
+    FROM dbo.Account WITH (UPDLOCK, HOLDLOCK)
+    WHERE UserID COLLATE Latin1_General_BIN LIKE @Pattern;
+
+    SET @Number = CASE WHEN @Last IS NULL THEN 1 ELSE CAST(SUBSTRING(@Last, 2, 7) AS INT) + 1 END;
+
+    IF @Number > 9999999
+    BEGIN
+        ROLLBACK TRANSACTION;
+        THROW 50012, 'This level has no free IDs left.', 1;
+    END;
+
+    SET @NewUserID  = @Letter + RIGHT(N'0000000' + CAST(@Number AS NVARCHAR(7)), 7);
+    SET @ResidentID = NEXT VALUE FOR dbo.Seq_ResidentID;
+
+    INSERT INTO dbo.Residents (ID, Work, Health, Family, [Level], Money, LiveStatus, Salary, Important)
+    VALUES (@ResidentID, @Work, 100, @Family, @Level, @Money, N'alive', @Salary, @Important);
+
+    INSERT INTO dbo.Account (UserID, [Password], [Level], FirstName, LastName, DateOfBirth, ResidentID)
+    VALUES (@NewUserID, @Password, @Level, @FirstName, @LastName, @DateOfBirth, @ResidentID);
+
+    UPDATE dbo.Levels SET Population = Population + 1, Alive = Alive + 1 WHERE [Level] = @Level;
+
+    COMMIT TRANSACTION;
+END;
+GO
+
+/* ---------- 7. usp_FlushEffects: mark dead residents ---------- */
+CREATE OR ALTER PROCEDURE dbo.usp_FlushEffects
+    @Level INT = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    DECLARE @Applied TABLE ([Level] INT PRIMARY KEY, HealthPointsApplied INT, MoneyApplied INT);
+
+    BEGIN TRANSACTION;
+
+    DECLARE @CurrentLevel INT, @PendingHealth FLOAT, @PendingMoney FLOAT,
+            @DamageHealth INT, @DamageMoney INT;
+
+    DECLARE effect_cursor CURSOR LOCAL FAST_FORWARD FOR
+        SELECT [Level], Pending_Health, Pending_Money
+        FROM dbo.Level_Effects
+        WHERE @Level IS NULL OR [Level] = @Level
+        ORDER BY [Level];
+
+    OPEN effect_cursor;
+    FETCH NEXT FROM effect_cursor INTO @CurrentLevel, @PendingHealth, @PendingMoney;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @DamageHealth = FLOOR(@PendingHealth + 0.000000001);
+        SET @DamageMoney  = FLOOR(@PendingMoney  + 0.000000001);
+
+        IF @DamageHealth > 0 OR @DamageMoney > 0
+        BEGIN
+            UPDATE dbo.Residents
+            SET Health = CASE WHEN Health - @DamageHealth < 0 THEN 0 ELSE Health - @DamageHealth END,
+                Money  = CASE WHEN Money  - @DamageMoney  < 0 THEN 0 ELSE Money  - @DamageMoney  END
+            WHERE [Level] = @CurrentLevel AND Health > 0;
+
+            UPDATE dbo.Residents SET LiveStatus = N'dead'
+            WHERE [Level] = @CurrentLevel AND Health = 0 AND LiveStatus = N'alive';
+
+            UPDATE dbo.Level_Effects
+            SET Pending_Health = Pending_Health - @DamageHealth,
+                Pending_Money  = Pending_Money  - @DamageMoney
+            WHERE [Level] = @CurrentLevel;
+
+            INSERT INTO @Applied VALUES (@CurrentLevel, @DamageHealth, @DamageMoney);
+        END;
+
+        FETCH NEXT FROM effect_cursor INTO @CurrentLevel, @PendingHealth, @PendingMoney;
+    END;
+
+    CLOSE effect_cursor;
+    DEALLOCATE effect_cursor;
+
+    COMMIT TRANSACTION;
+
+    SELECT [Level], HealthPointsApplied, MoneyApplied FROM @Applied ORDER BY [Level];
+END;
+GO
