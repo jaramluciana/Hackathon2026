@@ -23,11 +23,15 @@ import argparse
 import random
 import time
 from HollowEvents import EventManager
+from HollowWorkers import Workforce
 
 # NOTE: change "hollow_db" to whatever you named the database file (no .py).
 # Importing is safe: that file's demo only runs under its own __main__ block.
 from Hpeople import (
+    CONSUMPTION_PER_RESIDENT_PER_SIM_HOUR,
     NUM_RESIDENTS,
+    PRODUCER_COLUMN,
+    PRODUCTION_PER_WORKER_PER_SIM_HOUR,
     SYSTEM_TYPES,
     build_database,
     flush_effects,
@@ -66,6 +70,23 @@ AGING_PER_SIM_HOUR = 0.01     # wear speeds up 1% per sim hour: things fall apar
 # them into a slow burn. Raise it for a harsher world, lower it for a gentler one.
 DAMAGE_SCALE = 0.5
 
+# Engineer repair. On each level the engineers standing there (home crew + visitors from other
+# levels, see HollowWorkers.py) work through REPAIR_ORDER: all of them fix the first system in the
+# list that is below 100%, and only move to the next one once it is back to 100%. Water comes last.
+# Each living engineer restores this many status points per SIMULATED hour (at the default speed,
+# 1 sim hour = 60 ticks). Levels have ~120 engineers, max 500:
+#   120 engineers (home crew) -> ~0.16 pts/tick  (a 50-point outage takes ~5 real minutes)
+#   500 engineers (full cap)  -> ~0.67 pts/tick  (a 50-point outage takes ~75 real seconds)
+# Engineer counts are cached on the levels table (kept current by HollowWorkers and
+# refresh_population).
+REPAIR_ORDER = ("electricity", "communication", "housing", "water")
+ENGINEER_REPAIR_PER_SIM_HOUR = {      # per-system speed; make housing slower etc. here
+    "electricity":   0.08,
+    "communication": 0.08,
+    "housing":       0.08,
+    "water":         0.08,
+}
+
 # Flush policy: apply pending damage to residents when EITHER is true.
 FLUSH_EVERY_TICKS = 15        # on a timer (flush_effects skips levels with < 1 whole point pending)
 FLUSH_PENDING_LIMIT = 3.0     # or as soon as any level has this many health points pending
@@ -95,10 +116,12 @@ class HollowClock:
         self._since_refresh = 0
         self._rng = random.Random(seed)
         self.events = EventManager(con, self._rng)
+        self.workforce = Workforce(con, sim_seconds_per_tick, REPAIR_ORDER)
         self.last_events = []
 
         names = [s[0] for s in SYSTEM_TYPES]
         levels = [r[0] for r in con.execute("SELECT level FROM levels")]
+        self._levels = sorted(levels)
         self._wear_factor = {(lvl, name): self._rng.uniform(*LEVEL_VARIATION)
                              for lvl in levels for name in names}
 
@@ -107,7 +130,10 @@ class HollowClock:
         self.sim_time += self.sim_per_tick
         self.ticks += 1
         self._degrade()
-        self.last_events = self.events.step(self.sim_time)  # new
+        self.last_events = self.events.step(self.sim_time)
+        self.last_events += self.workforce.step(self.sim_time)   # crews walk / get sent out
+        self._repair()
+        self._supply()
         recompute_rates(self.con)
         tick(self.con, self.sim_per_tick * DAMAGE_SCALE)
         applied = self._maybe_flush()
@@ -117,6 +143,8 @@ class HollowClock:
     def _degrade(self):
         """Wear every (level, system) down a little. Re-reads status each tick, so
         repairs made by other modules are respected."""
+        if WEAR_MULTIPLIER <= 0:      # passive wear is off: nothing to do (skips a per-tick query)
+            return
         aging = 1.0 + AGING_PER_SIM_HOUR * (self.sim_time / 3600.0)
         hours = self.sim_per_tick / 3600.0
         rows = self.con.execute("SELECT level, system, status FROM level_systems").fetchall()
@@ -141,14 +169,74 @@ class HollowClock:
                 self.con.executemany(
                     "INSERT INTO event_log (sim_time, level, system, message) VALUES (?,?,?,?)", events)
 
+    def _repair(self):
+        """Engineers slowly bring damaged systems back up, in REPAIR_ORDER, one system at a time
+        per level (electricity -> communication -> housing). Repair speed scales with the level's
+        cached living-engineer count. Reads ~30 rows, writes at most 10."""
+        hours = self.sim_per_tick / 3600.0
+        engineers = {r[0]: r[1] for r in self.con.execute("SELECT level, engineers FROM levels")}
+        marks = ",".join("?" * len(REPAIR_ORDER))
+        grid = {}
+        for r in self.con.execute(
+                f"SELECT level, system, status FROM level_systems WHERE system IN ({marks})", REPAIR_ORDER):
+            grid.setdefault(r["level"], {})[r["system"]] = r["status"]
+
+        updates = []
+        for lvl, n in engineers.items():
+            if n <= 0:
+                continue
+            for name in REPAIR_ORDER:                      # first unfinished system gets the work
+                status = grid.get(lvl, {}).get(name)
+                if status is None or status >= 100:
+                    continue
+                gain = n * ENGINEER_REPAIR_PER_SIM_HOUR.get(name, 0.0) * hours
+                updates.append((min(100.0, status + gain), lvl, name))
+                break
+        if updates:
+            with self.con:
+                self.con.executemany(
+                    "UPDATE level_systems SET status = ? WHERE level = ? AND system = ?", updates)
+
+    def _supply(self):
+        """Food and medicine: residents use them up and farmers / medics make more (production
+        is set above break-even in Hpeople, so stock refills; visiting farmers/medics count).
+        Every living resident uses the same amount per sim hour on every level (fair), so a level
+        with a small portion runs out sooner. Every living farmer adds food and every living medic
+        adds medicine. The net change is applied to the level's food/medicine status (100% = its
+        full portion, so stock can't exceed it), which keeps events, healing, curing and damage
+        working. Reads and writes ~20 rows; uses the cached alive / farmer / medic counts."""
+        hours = self.sim_per_tick / 3600.0
+        updates = []
+        for r in self.con.execute("""SELECT s.level, s.system, s.capacity, ls.status, l.alive,
+                                            l.farmers, l.medics
+                                     FROM level_supply s
+                                     JOIN level_systems ls ON ls.level = s.level AND ls.system = s.system
+                                     JOIN levels l ON l.level = s.level"""):
+            if r["capacity"] <= 0:
+                continue
+            system = r["system"]
+            used = r["alive"] * CONSUMPTION_PER_RESIDENT_PER_SIM_HOUR[system]            # units / sim hour
+            made = r[PRODUCER_COLUMN[system]] * PRODUCTION_PER_WORKER_PER_SIM_HOUR[system]
+            new = max(0.0, min(100.0, r["status"] + 100.0 * (made - used) * hours / r["capacity"]))
+            if new != r["status"]:
+                updates.append((new, r["level"], system))
+        if updates:
+            with self.con:
+                self.con.executemany(
+                    "UPDATE level_systems SET status = ? WHERE level = ? AND system = ?", updates)
+
     def _maybe_flush(self):
-        self._since_flush += 1
-        worst = self.con.execute("SELECT MAX(pending_health) FROM level_effects").fetchone()[0] or 0.0
-        if self._since_flush < FLUSH_EVERY_TICKS and worst < FLUSH_PENDING_LIMIT:
+        # Staggered: each level is flushed once every FLUSH_EVERY_TICKS ticks, but on different
+        # ticks, so the cost is spread out instead of one big stall. A level with lots of pending
+        # damage is flushed right away.
+        due = [lvl for i, lvl in enumerate(self._levels) if (self.ticks + i) % FLUSH_EVERY_TICKS == 0]
+        urgent = [r[0] for r in self.con.execute(
+            "SELECT level FROM level_effects WHERE pending_health >= ?", (FLUSH_PENDING_LIMIT,))]
+        levels = sorted(set(due) | set(urgent))
+        if not levels:
             return {}
-        self._since_flush = 0
         t = time.perf_counter()
-        applied = flush_effects(self.con)
+        applied = flush_effects(self.con, levels)
         self.last_flush_ms = (time.perf_counter() - t) * 1000
         return applied
 
