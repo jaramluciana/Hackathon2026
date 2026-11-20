@@ -1,6 +1,5 @@
 import pyodbc
 import os
-import pyodbc
 
 SQL_SERVER = os.environ.get("HOLLOW_SQL_SERVER", "localhost")
 SQL_DATABASE = os.environ.get("HOLLOW_SQL_DATABASE", "ResidentInfors")
