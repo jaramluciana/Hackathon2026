@@ -1,11 +1,16 @@
 import pyodbc
+import os
+import pyodbc
+
+SQL_SERVER = os.environ.get("HOLLOW_SQL_SERVER", "localhost")
+SQL_DATABASE = os.environ.get("HOLLOW_SQL_DATABASE", "ResidentInfors")
 
 
 def get_connection():
     return pyodbc.connect(
         "DRIVER={ODBC Driver 17 for SQL Server};"
-        "SERVER=localhost;"
-        "DATABASE=ResidentInfors;"
+        f"SERVER={SQL_SERVER};"
+        f"DATABASE={SQL_DATABASE};"
         "Trusted_Connection=yes;"
     )
 
