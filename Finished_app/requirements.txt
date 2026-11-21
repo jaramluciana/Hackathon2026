@@ -1,0 +1,6 @@
+flet==1.1.2
+flet-cli==1.1.2
+flet-desktop==1.1.2
+flet-platform-assets==1.1.2
+flet-web==1.1.2
+pyodbc==5.5.0
